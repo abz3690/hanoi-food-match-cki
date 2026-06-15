@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 
+RANDOM_STATE = 42
+BEST_WEIGHTS = (0.50, 0.35, 0.15)
+
+REQUIRED_FOOD_SHEETS = {"foods", "places", "place_food_map"}
+REQUIRED_RATING_SHEETS = {"users", "user_ratings", "rated_only"}
 
 DISTRICT_COORDS = {
     "Hoàn Kiếm": (21.0285, 105.8542),
@@ -28,7 +34,7 @@ DISTRICT_COORDS = {
     "Hà Đông": (20.9712, 105.7788),
 }
 
-LOCATION_COORDS = {
+USER_LOCATION_COORDS = {
     "Hồ Gươm - Hoàn Kiếm": (21.0285, 105.8542),
     "Phố cổ - Hoàn Kiếm": (21.0340, 105.8500),
     "Nhà thờ Lớn - Hoàn Kiếm": (21.0287, 105.8497),
@@ -43,475 +49,775 @@ LOCATION_COORDS = {
 }
 
 CONTEXT_KEYWORDS = {
-    "Bữa sáng": ["sáng", "breakfast", "xôi", "bánh mì", "cháo", "phở", "bún"],
-    "Bữa trưa": ["trưa", "lunch", "cơm", "bún", "phở", "mì", "miến", "cháo"],
-    "Bữa tối": ["tối", "dinner", "lẩu", "nướng", "bbq", "steak", "sushi", "hải sản"],
-    "Hẹn hò": ["date", "hẹn hò", "lẩu", "nướng", "sushi", "steak", "pasta", "dessert"],
-    "Ăn nhanh": ["nhanh", "quick", "bánh mì", "phở", "bún", "mì", "xôi", "cháo"],
-    "Gia đình": ["gia đình", "family", "lẩu", "nướng", "cơm", "hải sản"],
-    "Lành mạnh": ["healthy", "lành mạnh", "salad", "cuốn", "hấp", "ít dầu"],
+    "breakfast": ["sáng", "breakfast", "xôi", "bánh mì", "cháo", "phở", "bún"],
+    "lunch": ["trưa", "lunch", "cơm", "bún", "phở", "mì", "miến", "cháo"],
+    "dinner": ["tối", "dinner", "lẩu", "nướng", "bbq", "steak", "sushi", "hải sản"],
+    "quick_meal": ["nhanh", "quick", "bánh mì", "phở", "bún", "mì", "xôi", "cháo"],
+    "date": ["date", "hẹn hò", "lẩu", "nướng", "sushi", "steak", "pasta", "dessert"],
+    "family": ["gia đình", "family", "lẩu", "nướng", "cơm", "hải sản"],
+    "healthy": ["healthy", "lành mạnh", "salad", "cuốn", "hấp", "ít dầu"],
+}
+
+DEMO_EXCLUDE_KEYWORDS = {
+    "bánh bao", "bánh tôm", "sữa chua", "nếp cẩm", "chuối nếp",
+    "kem", "chè", "tráng miệng", "tiramisu", "croissant", "bánh ngọt",
+}
+
+ALLOWED_MAIN_TYPES = {
+    "main_dish", "rice_dish", "noodle_dish", "noodle_soup", "hotpot",
+    "grilled_dish", "fried_dish", "curry_stew", "salad", "sushi",
+    "ramen", "steak",
 }
 
 
-def read_excel_sheets(path_or_file) -> dict[str, pd.DataFrame]:
-    return pd.read_excel(path_or_file, sheet_name=None)
-
-
-def find_data_files(data_dir: str | Path = "data") -> tuple[Path | None, Path | None]:
-    data_path = Path(data_dir)
-    if not data_path.exists():
-        return None, None
-
-    excel_files = sorted(list(data_path.glob("*.xlsx")) + list(data_path.glob("*.xls")))
-    if not excel_files:
-        return None, None
-
-    food_master = None
-    rating_file = None
-    for file in excel_files:
-        try:
-            sheets = set(pd.ExcelFile(file).sheet_names)
-        except Exception:
-            continue
-        if {"foods", "places", "place_food_map"}.issubset(sheets):
-            food_master = file
-        if {"user_ratings"}.issubset(sheets) or {"ratings"}.issubset(sheets) or {"rated_only"}.issubset(sheets):
-            rating_file = file
-
-    return food_master, rating_file
-
-
-def get_sheet(sheets: dict[str, pd.DataFrame], candidates: Iterable[str]) -> pd.DataFrame:
-    lower_map = {k.lower().strip(): k for k in sheets}
-    for name in candidates:
-        key = name.lower().strip()
-        if key in lower_map:
-            return sheets[lower_map[key]].copy()
-    raise ValueError(f"Không tìm thấy sheet: {', '.join(candidates)}")
-
-
-def pick_col(df: pd.DataFrame, candidates: Iterable[str], default: str | None = None) -> str | None:
-    lower_map = {str(c).lower().strip(): c for c in df.columns}
-    for col in candidates:
-        key = col.lower().strip()
-        if key in lower_map:
-            return lower_map[key]
-    return default
-
-
-def minmax_safe(values) -> pd.Series:
-    s = pd.to_numeric(pd.Series(values), errors="coerce").fillna(0.0)
-    if np.isclose(s.max(), s.min()):
-        return pd.Series(0.5, index=s.index, dtype=float)
-    return (s - s.min()) / (s.max() - s.min())
-
-
-def normalize_district(value) -> str:
-    if pd.isna(value):
-        return "Hoàn Kiếm"
-    text = str(value).strip()
-    text = text.replace("Quận ", "").replace("quận ", "")
-    text = text.replace("Q. ", "").replace("Q.", "")
-    return text.strip() or "Hoàn Kiếm"
-
-
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    if any(pd.isna(x) for x in [lat1, lon1, lat2, lon2]):
-        return np.nan
-    radius = 6371.0
-    lat1, lon1, lat2, lon2 = map(np.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return float(radius * 2 * np.arcsin(np.sqrt(a)))
-
-
-def extract_lat_lon_from_url(url):
-    if pd.isna(url):
-        return np.nan, np.nan
-    text = str(url)
-    patterns = [
-        r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)",
-        r"[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)",
-        r"[?&]ll=(-?\d+\.\d+),(-?\d+\.\d+)",
-        r"@(-?\d+\.\d+),(-?\d+\.\d+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            lat, lon = float(match.group(1)), float(match.group(2))
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                return lat, lon
-    return np.nan, np.nan
-
-
 @dataclass
-class RecommenderData:
+class RecommendationSystem:
     foods: pd.DataFrame
     places: pd.DataFrame
     place_food_map: pd.DataFrame
+    users: pd.DataFrame
     ratings: pd.DataFrame
-    users: pd.DataFrame | None = None
+    train_ratings: pd.DataFrame
+    foods_model: pd.DataFrame
+    food_matrix: sparse.spmatrix
+    food_id_to_idx: dict[str, int]
+    cf_predictions: pd.DataFrame
+    item_mean: pd.Series
+    global_mean: float
+    popularity_map: pd.Series
+    weights: tuple[float, float, float] = BEST_WEIGHTS
 
+    @property
+    def eligible_users(self) -> list[str]:
+        return sorted(self.ratings["user_id"].astype(str).unique().tolist())
 
-def load_data(food_master, rating_file) -> RecommenderData:
-    food_sheets = read_excel_sheets(food_master)
-    rating_sheets = read_excel_sheets(rating_file)
-    foods = get_sheet(food_sheets, ["foods", "food", "mon_an"])
-    places = get_sheet(food_sheets, ["places", "place", "quan_an"])
-    place_food_map = get_sheet(food_sheets, ["place_food_map", "map", "mapping"])
-    ratings = get_sheet(rating_sheets, ["user_ratings", "ratings", "rated_only"])
-    users = None
-    try:
-        users = get_sheet(rating_sheets, ["users", "user"])
-    except ValueError:
-        pass
-    return RecommenderData(foods, places, place_food_map, ratings, users)
+    @property
+    def available_cuisines(self) -> list[str]:
+        if "cuisine_group" not in self.foods_model.columns:
+            return []
+        values = self.foods_model["cuisine_group"].dropna().astype(str)
+        return sorted(v for v in values.unique() if v.strip() and v.lower() != "unknown")
 
+    def _minmax(self, values: pd.Series) -> pd.Series:
+        values = pd.Series(values, dtype=float)
+        if values.empty or np.isclose(values.max(), values.min()):
+            return pd.Series(0.0, index=values.index)
+        return (values - values.min()) / (values.max() - values.min())
 
-class HanoiFoodRecommender:
-    def __init__(self, data: RecommenderData):
-        self.foods = data.foods.copy()
-        self.places = data.places.copy()
-        self.place_food_map = data.place_food_map.copy()
-        self.ratings = data.ratings.copy()
-        self.users = data.users.copy() if data.users is not None else None
-        self._standardize()
-        self._fit_food_vectors()
+    def content_scores_for_user(self, user_id: str) -> pd.Series:
+        user_id = str(user_id)
+        history = self.train_ratings[
+            (self.train_ratings["user_id"] == user_id)
+            & (self.train_ratings["food_id"].isin(self.food_id_to_idx))
+        ].copy()
+        food_ids = self.foods_model["food_id"].astype(str)
+        if history.empty:
+            return pd.Series(0.0, index=food_ids)
 
-    def _standardize(self):
-        self.food_id_col = pick_col(self.foods, ["food_id", "id", "ma_mon"], self.foods.columns[0])
-        self.food_name_col = pick_col(self.foods, ["dish_name", "food_name", "name", "ten_mon"], self.foods.columns[1])
-        self.place_id_col = pick_col(self.places, ["place_id", "id", "ma_quan"], self.places.columns[0])
-        self.place_name_col = pick_col(self.places, ["place_name", "name", "ten_quan"], self.places.columns[1])
-        self.map_place_col = pick_col(self.place_food_map, ["place_id", "ma_quan"], self.place_food_map.columns[0])
-        self.map_food_col = pick_col(self.place_food_map, ["food_id", "ma_mon"], self.place_food_map.columns[1])
-        self.user_col = pick_col(self.ratings, ["user_id", "user", "ma_user"], self.ratings.columns[0])
-        self.rating_food_col = pick_col(self.ratings, ["food_id", "ma_mon"], self.ratings.columns[1])
-        self.rating_col = pick_col(self.ratings, ["rating", "score", "diem"], self.ratings.columns[-1])
-        self.cuisine_col = pick_col(self.foods, ["cuisine_group", "cuisine", "category", "nhom_am_thuc"])
-        self.dish_type_col = pick_col(self.foods, ["dish_type", "type", "loai_mon"])
-        self.spicy_col = pick_col(self.foods, ["spicy_level", "spicy", "do_cay"])
-        self.district_col = pick_col(self.places, ["district", "quan", "khu_vuc"])
-        self.avg_rating_col = pick_col(self.places, ["avg_rating", "rating", "google_rating"])
-        self.review_col = pick_col(self.places, ["review_count", "reviews", "num_reviews"])
-        self.lat_col = pick_col(self.places, ["latitude", "lat"])
-        self.lon_col = pick_col(self.places, ["longitude", "lon", "lng"])
-        self.map_url_col = pick_col(self.places, ["check", "google_maps_link", "google_map_link", "maps_link", "map_link"])
+        indices = [self.food_id_to_idx[fid] for fid in history["food_id"]]
+        weights = history["rating"].to_numpy(dtype=float) - 3.0
+        if np.allclose(weights, 0):
+            weights = np.ones_like(weights)
 
-        self.foods["food_id"] = self.foods[self.food_id_col].astype(str)
-        self.foods["dish_name"] = self.foods[self.food_name_col].astype(str)
-        self.places["place_id"] = self.places[self.place_id_col].astype(str)
-        self.places["place_name"] = self.places[self.place_name_col].astype(str)
-        self.place_food_map["place_id"] = self.place_food_map[self.map_place_col].astype(str)
-        self.place_food_map["food_id"] = self.place_food_map[self.map_food_col].astype(str)
-        self.ratings["user_id"] = self.ratings[self.user_col].astype(str)
-        self.ratings["food_id"] = self.ratings[self.rating_food_col].astype(str)
-        self.ratings["rating"] = pd.to_numeric(self.ratings[self.rating_col], errors="coerce").fillna(0)
+        profile = self.food_matrix[indices].multiply(weights[:, None]).sum(axis=0)
+        profile = normalize(sparse.csr_matrix(profile))
+        scores = cosine_similarity(profile, self.food_matrix).ravel()
+        return pd.Series(scores, index=food_ids)
 
-        if self.cuisine_col is None:
-            self.foods["cuisine_group"] = "Khác"
+    def user_score_table(self, user_id: str) -> pd.DataFrame:
+        alpha, beta, gamma = self.weights
+        user_id = str(user_id)
+        result = self.foods_model[["food_id", "dish_name"]].copy()
+        result["food_id"] = result["food_id"].astype(str)
+        all_ids = result["food_id"].tolist()
+
+        content = self.content_scores_for_user(user_id).reindex(all_ids).fillna(0)
+        if user_id in self.cf_predictions.index:
+            cf = self.cf_predictions.loc[user_id].reindex(all_ids)
+            cf = cf.fillna(self.item_mean.reindex(all_ids)).fillna(self.global_mean)
         else:
-            self.foods["cuisine_group"] = self.foods[self.cuisine_col].fillna("Khác").astype(str)
+            cf = self.item_mean.reindex(all_ids).fillna(self.global_mean)
 
-        if self.dish_type_col is None:
-            self.foods["dish_type"] = "Khác"
-        else:
-            self.foods["dish_type"] = self.foods[self.dish_type_col].fillna("Khác").astype(str)
-
-        if self.spicy_col is None:
-            self.foods["spicy_level"] = 0
-        else:
-            self.foods["spicy_level"] = pd.to_numeric(self.foods[self.spicy_col], errors="coerce").fillna(0)
-
-        if self.district_col is None:
-            self.places["district"] = "Hoàn Kiếm"
-        else:
-            self.places["district"] = self.places[self.district_col].apply(normalize_district)
-
-        if self.avg_rating_col is None:
-            self.places["avg_rating"] = 4.0
-        else:
-            self.places["avg_rating"] = pd.to_numeric(self.places[self.avg_rating_col], errors="coerce").fillna(4.0)
-
-        if self.review_col is None:
-            self.places["review_count"] = 0
-        else:
-            self.places["review_count"] = pd.to_numeric(self.places[self.review_col], errors="coerce").fillna(0)
-
-        self._prepare_place_coordinates()
-        self.popularity = self.ratings.groupby("food_id")["rating"].mean()
-
-    def _prepare_place_coordinates(self):
-        if self.lat_col is not None and self.lon_col is not None:
-            self.places["latitude"] = pd.to_numeric(self.places[self.lat_col], errors="coerce")
-            self.places["longitude"] = pd.to_numeric(self.places[self.lon_col], errors="coerce")
-        else:
-            self.places["latitude"] = np.nan
-            self.places["longitude"] = np.nan
-
-        if self.map_url_col is not None:
-            missing = self.places["latitude"].isna() | self.places["longitude"].isna()
-            coords = self.places.loc[missing, self.map_url_col].apply(extract_lat_lon_from_url)
-            if len(coords) > 0:
-                self.places.loc[missing, "latitude"] = [x[0] for x in coords]
-                self.places.loc[missing, "longitude"] = [x[1] for x in coords]
-
-        for idx, row in self.places.iterrows():
-            if pd.isna(row["latitude"]) or pd.isna(row["longitude"]):
-                lat, lon = DISTRICT_COORDS.get(row["district"], DISTRICT_COORDS["Hoàn Kiếm"])
-                self.places.loc[idx, "latitude"] = lat
-                self.places.loc[idx, "longitude"] = lon
-
-    def _fit_food_vectors(self):
-        feature_cols = [
-            "dish_name", "cuisine_group", "dish_type",
-            "description", "tags", "flavor", "main_ingredient", "category",
-        ]
-        use_cols = [c for c in feature_cols if c in self.foods.columns]
-        text = self.foods[use_cols].fillna("").astype(str).agg(" ".join, axis=1)
-        self.foods["context_text"] = text.str.lower()
-        self.vectorizer = TfidfVectorizer(max_features=1500, ngram_range=(1, 2))
-        self.food_matrix = self.vectorizer.fit_transform(self.foods["context_text"])
-        self.food_id_to_idx = {fid: i for i, fid in enumerate(self.foods["food_id"].astype(str))}
-
-    def user_ids(self) -> list[str]:
-        return sorted(self.ratings["user_id"].dropna().astype(str).unique().tolist())
-
-    def cuisines(self) -> list[str]:
-        return sorted(self.foods["cuisine_group"].dropna().astype(str).unique().tolist())
-
-    def dish_types(self) -> list[str]:
-        return sorted(self.foods["dish_type"].dropna().astype(str).unique().tolist())
-
-    def districts(self) -> list[str]:
-        items = sorted(set(self.places["district"].dropna().astype(str)) | set(DISTRICT_COORDS))
-        return items
-
-    def locations(self) -> list[str]:
-        return list(LOCATION_COORDS)
-
-    def _user_profile(self, user_id: str):
-        user_ratings = self.ratings[(self.ratings["user_id"] == str(user_id)) & (self.ratings["rating"] > 0)]
-        idxs, weights = [], []
-        for _, row in user_ratings.iterrows():
-            fid = str(row["food_id"])
-            if fid in self.food_id_to_idx:
-                idxs.append(self.food_id_to_idx[fid])
-                weights.append(float(row["rating"]))
-        if not idxs:
-            return None
-        profile = self.food_matrix[idxs].multiply(np.array(weights)[:, None]).mean(axis=0)
-        return normalize(np.asarray(profile))
-
-    def recommend_user(self, user_id: str, top_k: int = 10, exclude_rated: bool = True) -> pd.DataFrame:
-        profile = self._user_profile(user_id)
-        result = self.foods[["food_id", "dish_name", "cuisine_group", "dish_type", "spicy_level", "context_text"]].copy()
-        if profile is None:
-            result["content_score"] = 0.0
-        else:
-            result["content_score"] = cosine_similarity(profile, self.food_matrix).ravel()
-        result["popularity_score"] = self.popularity.reindex(result["food_id"]).fillna(self.popularity.mean()).to_numpy()
+        pop = self.popularity_map.reindex(all_ids).fillna(0)
+        result["cf_score"] = cf.to_numpy()
+        result["content_score"] = content.to_numpy()
+        result["popularity_score"] = pop.to_numpy()
         result["hybrid_score"] = (
-            0.75 * minmax_safe(result["content_score"]).to_numpy()
-            + 0.25 * minmax_safe(result["popularity_score"]).to_numpy()
+            alpha * self._minmax(result["cf_score"]).to_numpy()
+            + beta * self._minmax(result["content_score"]).to_numpy()
+            + gamma * self._minmax(result["popularity_score"]).to_numpy()
         )
-        if exclude_rated:
-            rated = set(self.ratings.loc[self.ratings["user_id"] == str(user_id), "food_id"].astype(str))
-            result = result[~result["food_id"].isin(rated)]
-        return result.sort_values("hybrid_score", ascending=False).head(top_k).reset_index(drop=True)
+        return result
 
-    def context_match_score(self, row, meal_context=None, occasion=None, max_spicy=None) -> float:
-        text = str(row.get("context_text", "")).lower()
+    def new_user_score_table(
+        self,
+        liked_food_ids: Sequence[str] | None = None,
+        disliked_food_ids: Sequence[str] | None = None,
+        preferred_cuisines: Sequence[str] | None = None,
+        preferred_dish_types: Sequence[str] | None = None,
+        preferred_prices: Sequence[str] | None = None,
+        preferred_spicy_levels: Sequence[str] | None = None,
+        excluded_keywords: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """Create a cold-start profile without requiring a trained user_id."""
+        liked = [str(x) for x in (liked_food_ids or []) if str(x) in self.food_id_to_idx]
+        disliked = [str(x) for x in (disliked_food_ids or []) if str(x) in self.food_id_to_idx]
+
+        result = self.foods_model[["food_id", "dish_name"]].copy()
+        result["food_id"] = result["food_id"].astype(str)
+
+        seeds = liked + disliked
+        if seeds:
+            indices = [self.food_id_to_idx[fid] for fid in seeds]
+            weights = np.array([1.0] * len(liked) + [-0.8] * len(disliked), dtype=float)
+            profile = self.food_matrix[indices].multiply(weights[:, None]).sum(axis=0)
+            profile = sparse.csr_matrix(profile)
+            if np.linalg.norm(profile.toarray()) > 0:
+                profile = normalize(profile)
+                content = cosine_similarity(profile, self.food_matrix).ravel()
+            else:
+                content = np.zeros(len(self.foods_model))
+        else:
+            content = np.zeros(len(self.foods_model))
+
+        explicit = np.zeros(len(self.foods_model), dtype=float)
+        parts = 0
+        filters = [
+            ("cuisine_group", preferred_cuisines),
+            ("dish_type", preferred_dish_types),
+            ("price_range", preferred_prices),
+            ("spicy_level", preferred_spicy_levels),
+        ]
+        for col, values in filters:
+            if values and col in self.foods_model.columns:
+                allowed = {str(v).strip().lower() for v in values}
+                explicit += self.foods_model[col].astype(str).str.strip().str.lower().isin(allowed).astype(float).to_numpy()
+                parts += 1
+        if parts:
+            explicit /= parts
+
+        # Penalize foods containing ingredients/styles the user wants to avoid.
+        avoid_penalty = np.zeros(len(self.foods_model), dtype=float)
+        if excluded_keywords:
+            searchable_cols = [c for c in ["dish_name", "main_ingredient", "dish_type", "tags", "description"] if c in self.foods_model.columns]
+            searchable = self.foods_model[searchable_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+            for keyword in excluded_keywords:
+                key = str(keyword).strip().lower()
+                if key:
+                    avoid_penalty = np.maximum(avoid_penalty, searchable.str.contains(key, regex=False).astype(float).to_numpy())
+
+        pop = self.popularity_map.reindex(result["food_id"]).fillna(0).to_numpy(dtype=float)
+        content_norm = self._minmax(pd.Series(content)).to_numpy()
+        pop_norm = self._minmax(pd.Series(pop)).to_numpy()
+        if seeds:
+            hybrid = 0.65 * content_norm + 0.25 * explicit + 0.10 * pop_norm
+        elif parts:
+            hybrid = 0.75 * explicit + 0.25 * pop_norm
+        else:
+            hybrid = pop_norm
+
+        result["content_score"] = content
+        result["preference_score"] = explicit
+        result["popularity_score"] = pop
+        result["hybrid_score"] = np.clip(hybrid - 0.95 * avoid_penalty, 0, 1)
+        result["avoid_penalty"] = avoid_penalty
+        return result
+
+    def recommend_new_user(
+        self,
+        liked_food_ids: Sequence[str] | None = None,
+        disliked_food_ids: Sequence[str] | None = None,
+        preferred_cuisines: Sequence[str] | None = None,
+        preferred_dish_types: Sequence[str] | None = None,
+        preferred_prices: Sequence[str] | None = None,
+        preferred_spicy_levels: Sequence[str] | None = None,
+        excluded_keywords: Sequence[str] | None = None,
+        top_k: int = 10,
+        main_meal_only: bool = True,
+    ) -> pd.DataFrame:
+        scores_all = self.new_user_score_table(
+            liked_food_ids=liked_food_ids,
+            disliked_food_ids=disliked_food_ids,
+            preferred_cuisines=preferred_cuisines,
+            preferred_dish_types=preferred_dish_types,
+            preferred_prices=preferred_prices,
+            preferred_spicy_levels=preferred_spicy_levels,
+            excluded_keywords=excluded_keywords,
+        )
+
+        base_scores = self._filter_scores(
+            scores_all, self.build_candidate_catalog(main_meal_only), preferred_cuisines=None
+        )
+        if base_scores.empty and main_meal_only:
+            base_scores = self._filter_scores(scores_all, self.build_candidate_catalog(False), preferred_cuisines=None)
+
+        def keep_by_metadata(frame: pd.DataFrame, column: str, values: Sequence[str] | None) -> pd.DataFrame:
+            if not values or column not in self.foods_model.columns or frame.empty:
+                return frame
+            allowed = {str(v).strip().lower() for v in values if str(v).strip()}
+            lookup = self.foods_model[["food_id", column]].copy()
+            lookup["food_id"] = lookup["food_id"].astype(str)
+            lookup["_value"] = lookup[column].astype(str).str.strip().str.lower()
+            allowed_ids = set(lookup.loc[lookup["_value"].isin(allowed), "food_id"])
+            return frame[frame["food_id"].astype(str).isin(allowed_ids)]
+
+        # Cold-start inputs are treated as real preferences in priority order.
+        # Try exact cuisine + dish type first; if the demo data is too sparse,
+        # relax only the later condition instead of immediately showing unrelated cuisine.
+        strict_scores = keep_by_metadata(base_scores, "cuisine_group", preferred_cuisines)
+        strict_scores = keep_by_metadata(strict_scores, "dish_type", preferred_dish_types)
+
+        cuisine_scores = keep_by_metadata(base_scores, "cuisine_group", preferred_cuisines)
+        type_scores = keep_by_metadata(base_scores, "dish_type", preferred_dish_types)
+
+        if not strict_scores.empty:
+            scores = strict_scores
+        elif preferred_cuisines and not cuisine_scores.empty:
+            scores = cuisine_scores
+        elif preferred_dish_types and not type_scores.empty:
+            scores = type_scores
+        else:
+            scores = base_scores
+        excluded = set(map(str, (liked_food_ids or []))) | set(map(str, (disliked_food_ids or [])))
+        scores = scores[~scores["food_id"].isin(excluded)]
+        metadata_cols = [c for c in [
+            "food_id", "dish_name", "cuisine_group", "dish_type",
+            "main_ingredient", "price_range", "spicy_level", "healthy_score",
+        ] if c in self.foods_model.columns]
+        metadata = self.foods_model[metadata_cols].copy()
+        metadata["food_id"] = metadata["food_id"].astype(str)
+        result = scores.sort_values("hybrid_score", ascending=False).head(top_k)
+        return result.drop(columns=["dish_name"], errors="ignore").merge(metadata, on="food_id", how="left")
+
+    def _context_text_lookup(self) -> pd.Series:
+        cols = [
+            c for c in [
+                "dish_name", "description", "tags", "feature_text", "cuisine_group",
+                "dish_type", "main_ingredient", "price_range"
+            ]
+            if c in self.foods_model.columns
+        ]
+        if not cols:
+            return pd.Series("", index=self.foods_model["food_id"].astype(str))
+        text = self.foods_model[cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        text.index = self.foods_model["food_id"].astype(str)
+        return text
+
+    def context_match_score(
+        self,
+        food_id: str,
+        meal_time: str | None = None,
+        occasion: str | None = None,
+        max_spicy: str | int | float | None = None,
+    ) -> float:
+        context_text = self._context_text_lookup().get(str(food_id), "")
         score = 0.0
-        for context in [meal_context, occasion]:
+
+        for context in [meal_time, occasion]:
             if not context:
                 continue
             keywords = CONTEXT_KEYWORDS.get(str(context), [str(context).lower()])
-            hits = sum(1 for keyword in keywords if keyword.lower() in text)
+            hits = sum(1 for keyword in keywords if keyword.lower() in context_text)
             score += min(hits, 3) / 3
-        if max_spicy is not None:
-            spicy = pd.to_numeric(row.get("spicy_level", 0), errors="coerce")
-            if pd.notna(spicy):
-                score += 0.5 if spicy <= max_spicy else -0.5
-        return score
 
-    def recommend_user_context_aware(
+        if max_spicy is not None and "spicy_level" in self.foods_model.columns:
+            spicy_lookup = self.foods_model.set_index(self.foods_model["food_id"].astype(str))["spicy_level"]
+            spicy = pd.to_numeric(pd.Series([spicy_lookup.get(str(food_id), np.nan)]), errors="coerce").iloc[0]
+            limit = pd.to_numeric(pd.Series([max_spicy]), errors="coerce").iloc[0]
+            if pd.notna(spicy) and pd.notna(limit):
+                score += 0.5 if spicy <= limit else -0.5
+
+        return float(score)
+
+    def context_rerank(
+        self,
+        frame: pd.DataFrame,
+        base_score_col: str = "hybrid_score",
+        top_k: int = 10,
+        meal_time: str | None = None,
+        occasion: str | None = None,
+        max_spicy: str | int | float | None = None,
+        context_weight: float = 0.35,
+        final_score_col: str = "context_aware_score",
+    ) -> pd.DataFrame:
+        if frame is None or frame.empty or "food_id" not in frame.columns:
+            return pd.DataFrame() if frame is None else frame
+
+        out = frame.copy()
+        if base_score_col not in out.columns:
+            base_score_col = "group_score" if "group_score" in out.columns else "hybrid_score"
+        if base_score_col not in out.columns:
+            out[base_score_col] = 0.0
+
+        out["context_score"] = out["food_id"].astype(str).map(
+            lambda fid: self.context_match_score(fid, meal_time=meal_time, occasion=occasion, max_spicy=max_spicy)
+        )
+        out["_base_norm"] = self._minmax(pd.to_numeric(out[base_score_col], errors="coerce").fillna(0)).to_numpy()
+        out["_context_norm"] = self._minmax(out["context_score"]).to_numpy()
+        out[final_score_col] = (
+            (1 - context_weight) * out["_base_norm"]
+            + context_weight * out["_context_norm"]
+        )
+        return (
+            out.drop(columns=["_base_norm", "_context_norm"], errors="ignore")
+            .sort_values(final_score_col, ascending=False)
+            .head(top_k)
+            .reset_index(drop=True)
+        )
+
+    def recommend_new_user_context_aware(self, top_k: int = 10, **kwargs) -> pd.DataFrame:
+        meal_time = kwargs.pop("meal_time", None)
+        occasion = kwargs.pop("occasion", None)
+        max_spicy = kwargs.pop("max_spicy", None)
+        context_weight = kwargs.pop("context_weight", 0.35)
+        base = self.recommend_new_user(top_k=max(top_k * 5, 30), **kwargs)
+        return self.context_rerank(
+            base,
+            base_score_col="hybrid_score",
+            top_k=top_k,
+            meal_time=meal_time,
+            occasion=occasion,
+            max_spicy=max_spicy,
+            context_weight=context_weight,
+        )
+
+    def recommend_user_context_aware(self, top_k: int = 10, **kwargs) -> pd.DataFrame:
+        meal_time = kwargs.pop("meal_time", None)
+        occasion = kwargs.pop("occasion", None)
+        max_spicy = kwargs.pop("max_spicy", None)
+        context_weight = kwargs.pop("context_weight", 0.35)
+        base = self.recommend_user(top_k=max(top_k * 5, 30), **kwargs)
+        return self.context_rerank(
+            base,
+            base_score_col="hybrid_score",
+            top_k=top_k,
+            meal_time=meal_time,
+            occasion=occasion,
+            max_spicy=max_spicy,
+            context_weight=context_weight,
+        )
+
+    def group_recommend_new_users(
+        self,
+        profiles: Sequence[dict],
+        strategy: str = "average",
+        top_k: int = 10,
+        main_meal_only: bool = True,
+    ) -> pd.DataFrame:
+        tables = []
+        excluded = set()
+        for idx, profile in enumerate(profiles, start=1):
+            table = self.new_user_score_table(**profile).set_index("food_id")["hybrid_score"]
+            tables.append(table.rename(f"Người {idx}"))
+            excluded.update(map(str, profile.get("liked_food_ids", []) or []))
+            excluded.update(map(str, profile.get("disliked_food_ids", []) or []))
+
+        matrix = pd.concat(tables, axis=1).fillna(0)
+        allowed = self.build_candidate_catalog(main_meal_only)
+        matrix = matrix.loc[matrix.index.intersection(allowed)]
+        if matrix.empty and main_meal_only:
+            allowed = self.build_candidate_catalog(False)
+            matrix = pd.concat(tables, axis=1).fillna(0)
+            matrix = matrix.loc[matrix.index.intersection(allowed)]
+        if strategy == "average":
+            group_score = matrix.mean(axis=1)
+        elif strategy == "least_misery":
+            group_score = matrix.min(axis=1)
+        elif strategy == "most_pleasure":
+            group_score = matrix.max(axis=1)
+        else:
+            raise ValueError("Chiến lược nhóm không hợp lệ")
+
+        ranking = group_score[~group_score.index.isin(excluded)].sort_values(ascending=False).head(top_k)
+        result = ranking.rename("group_score").reset_index()
+        metadata_cols = [c for c in ["food_id", "dish_name", "cuisine_group", "dish_type", "price_range"] if c in self.foods_model]
+        metadata = self.foods_model[metadata_cols].copy()
+        metadata["food_id"] = metadata["food_id"].astype(str)
+        result = result.merge(metadata, on="food_id", how="left")
+        for col in matrix.columns:
+            result[f"score_{col}"] = result["food_id"].map(matrix[col])
+        score_cols = [c for c in result.columns if c.startswith("score_")]
+        result["minimum_score"] = result[score_cols].min(axis=1)
+        result["fairness_gap"] = result[score_cols].max(axis=1) - result[score_cols].min(axis=1)
+        return result
+
+    def build_candidate_catalog(self, main_meal_only: bool = False) -> set[str]:
+        catalog = self.foods_model[["food_id", "dish_name"]].copy()
+        catalog["food_id"] = catalog["food_id"].astype(str)
+        if not main_meal_only:
+            return set(catalog["food_id"])
+
+        names = catalog["dish_name"].fillna("").astype(str).str.lower()
+        mask = ~names.apply(lambda x: any(keyword in x for keyword in DEMO_EXCLUDE_KEYWORDS))
+        if "dish_type" in self.foods_model.columns:
+            types = self.foods_model["dish_type"].fillna("").astype(str).str.lower()
+            mask &= types.isin(ALLOWED_MAIN_TYPES)
+        return set(catalog.loc[mask, "food_id"])
+
+    def _filter_scores(
+        self,
+        scores: pd.DataFrame,
+        candidate_catalog: Iterable[str] | None,
+        preferred_cuisines: Sequence[str] | None,
+    ) -> pd.DataFrame:
+        out = scores
+        if candidate_catalog is not None:
+            out = out[out["food_id"].isin(set(map(str, candidate_catalog)))]
+        if preferred_cuisines and "cuisine_group" in self.foods_model.columns:
+            allowed = {str(v).strip().lower() for v in preferred_cuisines}
+            cuisine = self.foods_model[["food_id", "cuisine_group"]].copy()
+            cuisine["food_id"] = cuisine["food_id"].astype(str)
+            cuisine["_cuisine"] = cuisine["cuisine_group"].astype(str).str.strip().str.lower()
+            allowed_ids = set(cuisine.loc[cuisine["_cuisine"].isin(allowed), "food_id"])
+            out = out[out["food_id"].isin(allowed_ids)]
+        return out
+
+    def recommend_user(
         self,
         user_id: str,
         top_k: int = 10,
-        meal_context: str | None = None,
-        occasion: str | None = None,
-        max_spicy: int | None = None,
-        context_weight: float = 0.35,
+        preferred_cuisines: Sequence[str] | None = None,
+        main_meal_only: bool = False,
+        exclude_seen: bool = True,
     ) -> pd.DataFrame:
-        base = self.recommend_user(user_id, top_k=max(top_k * 5, 30))
-        if base.empty:
-            return base
-        base["context_score"] = base.apply(
-            lambda row: self.context_match_score(row, meal_context, occasion, max_spicy),
-            axis=1,
+        scores = self.user_score_table(user_id)
+        scores = self._filter_scores(
+            scores,
+            self.build_candidate_catalog(main_meal_only),
+            preferred_cuisines,
         )
-        base["context_aware_score"] = (
-            (1 - context_weight) * minmax_safe(base["hybrid_score"]).to_numpy()
-            + context_weight * minmax_safe(base["context_score"]).to_numpy()
-        )
-        return base.sort_values("context_aware_score", ascending=False).head(top_k).reset_index(drop=True)
+        if scores.empty and preferred_cuisines:
+            # Relax cuisine filter if selected cuisines are too narrow.
+            scores = self._filter_scores(
+                self.user_score_table(user_id),
+                self.build_candidate_catalog(main_meal_only),
+                preferred_cuisines=None,
+            )
+        if scores.empty and main_meal_only:
+            scores = self._filter_scores(
+                self.user_score_table(user_id),
+                self.build_candidate_catalog(False),
+                preferred_cuisines=None,
+            )
+        if exclude_seen:
+            seen = set(self.train_ratings.loc[
+                self.train_ratings["user_id"] == str(user_id), "food_id"
+            ])
+            scores = scores[~scores["food_id"].isin(seen)]
+            if scores.empty:
+                # If the user has rated almost every candidate, show the best candidates anyway.
+                scores = self._filter_scores(
+                    self.user_score_table(user_id),
+                    self.build_candidate_catalog(main_meal_only),
+                    preferred_cuisines=None,
+                )
 
-    def cold_start_recommend(
+        metadata_cols = [c for c in [
+            "food_id", "dish_name", "cuisine_group", "dish_type",
+            "main_ingredient", "price_range", "spicy_level", "healthy_score",
+        ] if c in self.foods_model.columns]
+        metadata = self.foods_model[metadata_cols].copy()
+        metadata["food_id"] = metadata["food_id"].astype(str)
+        result = scores.sort_values("hybrid_score", ascending=False).head(top_k)
+        result = result.drop(columns=["dish_name"], errors="ignore").merge(metadata, on="food_id", how="left")
+        return result
+
+    def group_recommend(
         self,
-        liked_food_ids: list[str] | None = None,
-        preferred_cuisines: list[str] | None = None,
-        preferred_dish_types: list[str] | None = None,
-        max_spicy: int | None = None,
+        user_ids: Sequence[str],
+        strategy: str = "average",
         top_k: int = 10,
-        popularity_weight: float = 0.30,
-    ) -> pd.DataFrame:
-        candidates = self.foods[["food_id", "dish_name", "cuisine_group", "dish_type", "spicy_level", "context_text"]].copy()
-        mask = pd.Series(True, index=candidates.index)
-        if preferred_cuisines:
-            allowed = {str(x).lower() for x in preferred_cuisines}
-            mask &= candidates["cuisine_group"].astype(str).str.lower().isin(allowed)
-        if preferred_dish_types:
-            allowed = {str(x).lower() for x in preferred_dish_types}
-            mask &= candidates["dish_type"].astype(str).str.lower().isin(allowed)
-        if max_spicy is not None:
-            mask &= pd.to_numeric(candidates["spicy_level"], errors="coerce").fillna(0) <= max_spicy
+        preferred_cuisines: Sequence[str] | None = None,
+        main_meal_only: bool = True,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        tables = []
+        seen = set()
+        for user_id in user_ids:
+            table = self.user_score_table(str(user_id)).set_index("food_id")["hybrid_score"]
+            tables.append(table.rename(str(user_id)))
+            seen.update(self.train_ratings.loc[
+                self.train_ratings["user_id"] == str(user_id), "food_id"
+            ])
 
-        content_scores = pd.Series(0.0, index=self.foods["food_id"].astype(str))
-        liked_food_ids = [str(x) for x in (liked_food_ids or []) if str(x) in self.food_id_to_idx]
-        if liked_food_ids:
-            idxs = [self.food_id_to_idx[fid] for fid in liked_food_ids]
-            profile = normalize(np.asarray(self.food_matrix[idxs].mean(axis=0)))
-            content_scores = pd.Series(cosine_similarity(profile, self.food_matrix).ravel(), index=self.foods["food_id"].astype(str))
+        matrix = pd.concat(tables, axis=1).fillna(0)
+        allowed_ids = self.build_candidate_catalog(main_meal_only)
+        matrix = matrix.loc[matrix.index.intersection(allowed_ids)]
+        if preferred_cuisines and "cuisine_group" in self.foods_model.columns:
+            allowed = {str(v).strip().lower() for v in preferred_cuisines}
+            lookup = self.foods_model[["food_id", "cuisine_group"]].copy()
+            lookup["food_id"] = lookup["food_id"].astype(str)
+            allowed_ids = set(lookup.loc[
+                lookup["cuisine_group"].astype(str).str.strip().str.lower().isin(allowed),
+                "food_id",
+            ])
+            matrix = matrix.loc[matrix.index.intersection(allowed_ids)]
 
-        candidates["content_score"] = content_scores.reindex(candidates["food_id"]).fillna(0).to_numpy()
-        candidates["popularity_score"] = self.popularity.reindex(candidates["food_id"]).fillna(self.popularity.mean()).to_numpy()
-        candidates["cold_start_score"] = (
-            (1 - popularity_weight) * minmax_safe(candidates["content_score"]).to_numpy()
-            + popularity_weight * minmax_safe(candidates["popularity_score"]).to_numpy()
-        )
-        if liked_food_ids:
-            mask &= ~candidates["food_id"].isin(liked_food_ids)
-        filtered = candidates[mask]
-        if filtered.empty:
-            filtered = candidates
-        return filtered.sort_values("cold_start_score", ascending=False).head(top_k).reset_index(drop=True)
-
-    def group_existing_recommend(
-        self,
-        user_a: str,
-        user_b: str,
-        strategy: str = "Average",
-        top_k: int = 10,
-        meal_context: str | None = None,
-        occasion: str | None = None,
-        max_spicy: int | None = None,
-        context_weight: float = 0.35,
-    ) -> pd.DataFrame:
-        rec_a = self.recommend_user_context_aware(user_a, top_k=max(top_k * 5, 30), meal_context=meal_context, occasion=occasion, max_spicy=max_spicy, context_weight=context_weight)
-        rec_b = self.recommend_user_context_aware(user_b, top_k=max(top_k * 5, 30), meal_context=meal_context, occasion=occasion, max_spicy=max_spicy, context_weight=context_weight)
-        cols = ["food_id", "dish_name", "cuisine_group", "dish_type", "spicy_level"]
-        merged = rec_a[cols + ["context_aware_score"]].rename(columns={"context_aware_score": "score_a"}).merge(
-            rec_b[["food_id", "context_aware_score"]].rename(columns={"context_aware_score": "score_b"}),
-            on="food_id",
-            how="outer",
-        )
-        merged = merged.merge(self.foods[cols], on="food_id", how="left", suffixes=("", "_food"))
-        for col in cols[1:]:
-            merged[col] = merged[col].fillna(merged.get(f"{col}_food"))
-        merged[["score_a", "score_b"]] = merged[["score_a", "score_b"]].fillna(0)
-        if strategy == "Least Misery":
-            merged["final_food_score"] = merged[["score_a", "score_b"]].min(axis=1)
-        elif strategy == "Most Pleasure":
-            merged["final_food_score"] = merged[["score_a", "score_b"]].max(axis=1)
+        if strategy == "average":
+            group_score = matrix.mean(axis=1)
+        elif strategy == "least_misery":
+            group_score = matrix.min(axis=1)
+        elif strategy == "most_pleasure":
+            group_score = matrix.max(axis=1)
         else:
-            merged["final_food_score"] = merged[["score_a", "score_b"]].mean(axis=1)
-        return merged.sort_values("final_food_score", ascending=False).head(top_k).reset_index(drop=True)
+            raise ValueError("Chiến lược nhóm không hợp lệ")
 
-    def group_cold_start_recommend(self, pref_a: dict, pref_b: dict, strategy: str = "Average", top_k: int = 10) -> pd.DataFrame:
-        rec_a = self.cold_start_recommend(top_k=max(top_k * 5, 30), **pref_a)
-        rec_b = self.cold_start_recommend(top_k=max(top_k * 5, 30), **pref_b)
-        cols = ["food_id", "dish_name", "cuisine_group", "dish_type", "spicy_level"]
-        merged = rec_a[cols + ["cold_start_score"]].rename(columns={"cold_start_score": "score_a"}).merge(
-            rec_b[["food_id", "cold_start_score"]].rename(columns={"cold_start_score": "score_b"}),
-            on="food_id",
-            how="outer",
+        ranking = group_score[~group_score.index.isin(seen)].sort_values(ascending=False).head(top_k)
+        result = ranking.rename("group_score").reset_index()
+        metadata_cols = [c for c in ["food_id", "dish_name", "cuisine_group", "dish_type", "price_range"] if c in self.foods_model]
+        metadata = self.foods_model[metadata_cols].copy()
+        metadata["food_id"] = metadata["food_id"].astype(str)
+        result = result.merge(metadata, on="food_id", how="left")
+        for user_id in user_ids:
+            result[f"score_{user_id}"] = result["food_id"].map(matrix[str(user_id)])
+        score_cols = [f"score_{u}" for u in user_ids]
+        result["minimum_score"] = result[score_cols].min(axis=1)
+        result["fairness_gap"] = result[score_cols].max(axis=1) - result[score_cols].min(axis=1)
+        return result, matrix
+
+    def recommend_places_for_foods(self, food_ids: Sequence[str], top_n: int = 10) -> pd.DataFrame:
+        matched = self.place_food_map[
+            self.place_food_map["food_id"].astype(str).isin(set(map(str, food_ids)))
+        ].copy()
+        if matched.empty:
+            return pd.DataFrame()
+        result = (
+            matched.groupby("place_id")
+            .agg(
+                matched_food_count=("food_id", "nunique"),
+                matched_food_ids=("food_id", lambda x: ", ".join(sorted(set(map(str, x))))),
+            )
+            .reset_index()
+            .merge(self.places, on="place_id", how="left")
         )
-        merged = merged.merge(self.foods[cols], on="food_id", how="left", suffixes=("", "_food"))
-        for col in cols[1:]:
-            merged[col] = merged[col].fillna(merged.get(f"{col}_food"))
-        merged[["score_a", "score_b"]] = merged[["score_a", "score_b"]].fillna(0)
-        if strategy == "Least Misery":
-            merged["final_food_score"] = merged[["score_a", "score_b"]].min(axis=1)
-        elif strategy == "Most Pleasure":
-            merged["final_food_score"] = merged[["score_a", "score_b"]].max(axis=1)
-        else:
-            merged["final_food_score"] = merged[["score_a", "score_b"]].mean(axis=1)
-        return merged.sort_values("final_food_score", ascending=False).head(top_k).reset_index(drop=True)
+        result["avg_rating"] = pd.to_numeric(result.get("avg_rating", 0), errors="coerce").fillna(0)
+        result["review_count"] = pd.to_numeric(result.get("review_count", 0), errors="coerce").fillna(0)
+        result["place_score"] = (
+            result["matched_food_count"]
+            + 0.5 * result["avg_rating"]
+            + 0.1 * np.log1p(result["review_count"])
+        )
+        cols = [c for c in [
+            "place_name", "district", "matched_food_count", "avg_rating",
+            "review_count", "price_range", "google_maps_link", "place_score",
+        ] if c in result.columns]
+        return result.sort_values("place_score", ascending=False)[cols].head(top_n)
 
-    def get_user_location(self, district: str = "Hoàn Kiếm", location_name: str | None = None):
-        if location_name in LOCATION_COORDS:
-            return LOCATION_COORDS[location_name]
-        return DISTRICT_COORDS.get(normalize_district(district), DISTRICT_COORDS["Hoàn Kiếm"])
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+        if any(pd.isna(x) for x in [lat1, lon1, lat2, lon2]):
+            return np.nan
+        radius = 6371.0
+        lat1, lon1, lat2, lon2 = map(np.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+        return float(radius * 2 * np.arcsin(np.sqrt(a)))
+
+    def _user_location(self, user_district: str = "Hoàn Kiếm", user_location_name: str | None = None):
+        if user_location_name in USER_LOCATION_COORDS:
+            return USER_LOCATION_COORDS[user_location_name]
+        return DISTRICT_COORDS.get(str(user_district), DISTRICT_COORDS["Hoàn Kiếm"])
 
     def recommend_places_distance_aware(
         self,
-        top_food_ids: list[str],
+        food_ids: Sequence[str],
+        top_n: int = 10,
         user_district: str = "Hoàn Kiếm",
         user_location_name: str = "Hồ Gươm - Hoàn Kiếm",
         w_distance: float = 0.10,
-        top_k: int = 5,
     ) -> pd.DataFrame:
-        top_food_ids = [str(x) for x in top_food_ids]
-        matched = self.place_food_map[self.place_food_map["food_id"].astype(str).isin(top_food_ids)].copy()
+        matched = self.place_food_map[
+            self.place_food_map["food_id"].astype(str).isin(set(map(str, food_ids)))
+        ].copy()
         if matched.empty:
-            candidates = self.places.copy()
-            candidates["matched_food_count"] = 0
-        else:
-            matched_count = matched.groupby("place_id")["food_id"].nunique().reset_index(name="matched_food_count")
-            candidates = matched_count.merge(self.places, on="place_id", how="left")
-            if len(candidates) < top_k:
-                missing_ids = set(candidates["place_id"].astype(str))
-                extra = self.places[~self.places["place_id"].astype(str).isin(missing_ids)].head(top_k - len(candidates)).copy()
-                extra["matched_food_count"] = 0
-                candidates = pd.concat([candidates, extra], ignore_index=True)
+            return pd.DataFrame()
 
-        candidates["place_score_gki"] = (
-            pd.to_numeric(candidates["matched_food_count"], errors="coerce").fillna(0)
-            + 0.5 * pd.to_numeric(candidates["avg_rating"], errors="coerce").fillna(0)
-            + 0.1 * np.log1p(pd.to_numeric(candidates["review_count"], errors="coerce").fillna(0))
+        result = (
+            matched.groupby("place_id")
+            .agg(
+                matched_food_count=("food_id", "nunique"),
+                matched_food_ids=("food_id", lambda x: ", ".join(sorted(set(map(str, x))))),
+            )
+            .reset_index()
+            .merge(self.places, on="place_id", how="left")
         )
-        user_lat, user_lon = self.get_user_location(user_district, user_location_name)
-        candidates["distance_km"] = candidates.apply(
-            lambda row: haversine_km(user_lat, user_lon, row["latitude"], row["longitude"]),
+        result["avg_rating"] = pd.to_numeric(result.get("avg_rating", 0), errors="coerce").fillna(0)
+        result["review_count"] = pd.to_numeric(result.get("review_count", 0), errors="coerce").fillna(0)
+        result["place_score_gki"] = (
+            result["matched_food_count"]
+            + 0.5 * result["avg_rating"]
+            + 0.1 * np.log1p(result["review_count"])
+        )
+
+        lat, lon = self._user_location(user_district, user_location_name)
+        if "latitude" not in result.columns or "longitude" not in result.columns:
+            result["latitude"] = np.nan
+            result["longitude"] = np.nan
+        result["latitude"] = pd.to_numeric(result["latitude"], errors="coerce")
+        result["longitude"] = pd.to_numeric(result["longitude"], errors="coerce")
+        if "district" in result.columns:
+            for idx, row in result.iterrows():
+                if pd.isna(row["latitude"]) or pd.isna(row["longitude"]):
+                    fallback = DISTRICT_COORDS.get(str(row.get("district")), DISTRICT_COORDS["Hoàn Kiếm"])
+                    result.loc[idx, "latitude"] = fallback[0]
+                    result.loc[idx, "longitude"] = fallback[1]
+
+        result["distance_km"] = result.apply(
+            lambda row: self._haversine_km(lat, lon, row["latitude"], row["longitude"]),
             axis=1,
         )
-        candidates["distance_score"] = 1 / (1 + pd.to_numeric(candidates["distance_km"], errors="coerce").fillna(99))
-        candidates["place_score_cki"] = (
-            (1 - w_distance) * minmax_safe(candidates["place_score_gki"]).to_numpy()
-            + w_distance * minmax_safe(candidates["distance_score"]).to_numpy()
+        result["distance_score"] = 1 / (1 + pd.to_numeric(result["distance_km"], errors="coerce").fillna(99))
+        result["place_score_cki"] = (
+            (1 - w_distance) * self._minmax(result["place_score_gki"]).to_numpy()
+            + w_distance * self._minmax(result["distance_score"]).to_numpy()
         )
-        show_cols = [
-            "place_id", "place_name", "district", "matched_food_count",
-            "avg_rating", "review_count", "distance_km", "place_score_gki", "place_score_cki",
-        ]
-        return candidates.sort_values("place_score_cki", ascending=False)[show_cols].head(top_k).reset_index(drop=True)
+        cols = [c for c in [
+            "place_name", "district", "matched_food_count", "avg_rating", "review_count",
+            "distance_km", "price_range", "google_maps_link", "place_score_gki", "place_score_cki",
+        ] if c in result.columns]
+        return result.sort_values("place_score_cki", ascending=False)[cols].head(top_n)
 
-    @staticmethod
-    def model_info_tables():
+    def model_info_tables(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         summary = pd.DataFrame([
-            {"Model": "GKI Heuristic", "Precision@5": 0.5033, "NDCG@5": 0.5120, "AvgDistance@5": 2.4402, "Ghi chú": "Xếp hạng theo số món khớp, rating và review"},
-            {"Model": "CKI Distance-aware", "Precision@5": 0.5167, "NDCG@5": 0.5240, "AvgDistance@5": 2.2313, "Ghi chú": "Re-ranking với w_distance = 0.10"},
-            {"Model": "LTR Gradient Boosting", "Precision@5": 0.5600, "NDCG@5": 0.5710, "AvgDistance@5": 1.5861, "Ghi chú": "Learning-to-Rank out-of-fold"},
+            {"Mô hình": "GKI Heuristic", "Precision@5": 0.5033, "NDCG@5": 0.5120, "AvgDistance@5": 2.4402},
+            {"Mô hình": "CKI Distance-aware", "Precision@5": 0.5167, "NDCG@5": 0.5240, "AvgDistance@5": 2.2313},
+            {"Mô hình": "LTR Gradient Boosting", "Precision@5": 0.5600, "NDCG@5": 0.5710, "AvgDistance@5": 1.5861},
         ])
         features = pd.DataFrame([
             {"Feature": "matched_food_count", "Ý nghĩa": "Số món đề xuất có trong quán"},
             {"Feature": "avg_rating_norm", "Ý nghĩa": "Điểm đánh giá trung bình đã chuẩn hóa"},
             {"Feature": "review_count_norm", "Ý nghĩa": "Số lượt đánh giá đã log/chuẩn hóa"},
             {"Feature": "distance_km", "Ý nghĩa": "Khoảng cách từ người dùng tới quán"},
-            {"Feature": "distance_score_norm", "Ý nghĩa": "Điểm gần theo 1 / (1 + distance_km)"},
-            {"Feature": "gki_heuristic_score", "Ý nghĩa": "Điểm xếp hạng heuristic nền"},
-            {"Feature": "cki_distance_score", "Ý nghĩa": "Điểm sau khi bổ sung khoảng cách"},
+            {"Feature": "gki_heuristic_score", "Ý nghĩa": "Điểm heuristic nền"},
+            {"Feature": "cki_distance_score", "Ý nghĩa": "Điểm sau distance-aware re-ranking"},
         ])
         return summary, features
+
+
+def _safe_svd_predictions(train_ratings: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, float]:
+    matrix = train_ratings.pivot_table(index="user_id", columns="food_id", values="rating", aggfunc="mean").sort_index()
+    item_mean = train_ratings.groupby("food_id")["rating"].mean()
+    global_mean = float(train_ratings["rating"].mean())
+    if matrix.empty:
+        return pd.DataFrame(), item_mean, global_mean
+
+    means = matrix.mean(axis=1)
+    centered = matrix.sub(means, axis=0).fillna(0)
+    max_components = min(centered.shape) - 1
+    if max_components < 1:
+        baseline = pd.DataFrame(index=centered.index, columns=centered.columns, dtype=float)
+        for user_id in baseline.index:
+            baseline.loc[user_id] = item_mean.reindex(baseline.columns).fillna(global_mean).to_numpy()
+        return baseline, item_mean, global_mean
+
+    n_components = min(20, max_components)
+    svd = TruncatedSVD(n_components=n_components, random_state=RANDOM_STATE)
+    user_factors = svd.fit_transform(centered)
+    item_factors = svd.components_.T
+    predictions = pd.DataFrame(
+        user_factors @ item_factors.T,
+        index=centered.index,
+        columns=centered.columns,
+    ).add(means, axis=0)
+    return predictions, item_mean, global_mean
+
+
+def build_system(food_file, rating_file) -> RecommendationSystem:
+    foods = pd.read_excel(food_file, sheet_name="foods")
+    places = pd.read_excel(food_file, sheet_name="places")
+    place_food_map = pd.read_excel(food_file, sheet_name="place_food_map")
+    users = pd.read_excel(rating_file, sheet_name="users")
+    rated_only = pd.read_excel(rating_file, sheet_name="rated_only")
+
+    required_food_cols = {"food_id", "dish_name"}
+    required_rating_cols = {"user_id", "food_id", "rating"}
+    if not required_food_cols.issubset(foods.columns):
+        raise ValueError(f"Sheet foods thiếu cột: {sorted(required_food_cols - set(foods.columns))}")
+    if not required_rating_cols.issubset(rated_only.columns):
+        raise ValueError(f"Sheet rated_only thiếu cột: {sorted(required_rating_cols - set(rated_only.columns))}")
+
+    foods["food_id"] = foods["food_id"].astype(str)
+    valid_ids = set(foods["food_id"])
+    ratings = rated_only[["user_id", "food_id", "rating"]].copy()
+    ratings["user_id"] = ratings["user_id"].astype(str)
+    ratings["food_id"] = ratings["food_id"].astype(str)
+    ratings["rating"] = pd.to_numeric(ratings["rating"], errors="coerce")
+    ratings = (
+        ratings.dropna()
+        .query("1 <= rating <= 5")
+        .loc[lambda x: x["food_id"].isin(valid_ids)]
+        .groupby(["user_id", "food_id"], as_index=False)["rating"].mean()
+    )
+    if ratings.empty:
+        raise ValueError("Không có rating hợp lệ sau khi làm sạch dữ liệu.")
+
+    foods_model = foods.copy().reset_index(drop=True)
+    text_cols = [c for c in ["dish_name", "description", "tags", "feature_text"] if c in foods_model]
+    cat_cols = [c for c in ["cuisine_group", "dish_type", "main_ingredient", "price_range"] if c in foods_model]
+    num_cols = [c for c in ["spicy_level", "healthy_score", "date_score", "popularity_score"] if c in foods_model]
+    foods_model["text_feature"] = foods_model[text_cols].fillna("").astype(str).agg(" ".join, axis=1)
+    for col in cat_cols:
+        foods_model[col] = foods_model[col].fillna("unknown").astype(str)
+    for col in num_cols:
+        foods_model[col] = pd.to_numeric(foods_model[col], errors="coerce").fillna(0)
+
+    transformers = [("text", TfidfVectorizer(max_features=2500, ngram_range=(1, 2)), "text_feature")]
+    if cat_cols:
+        transformers.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols))
+    if num_cols:
+        transformers.append(("num", StandardScaler(), num_cols))
+    preprocessor = ColumnTransformer(transformers=transformers)
+    food_matrix = normalize(preprocessor.fit_transform(foods_model))
+    food_id_to_idx = {fid: idx for idx, fid in enumerate(foods_model["food_id"].astype(str))}
+
+    cf_predictions, item_mean, global_mean = _safe_svd_predictions(ratings)
+    popularity_map = (
+        foods_model.set_index(foods_model["food_id"].astype(str))["popularity_score"]
+        if "popularity_score" in foods_model.columns
+        else pd.Series(0.0, index=foods_model["food_id"].astype(str))
+    )
+    if "place_id" in places.columns:
+        places["place_id"] = places["place_id"].astype(str)
+    if "district" not in places.columns:
+        places["district"] = "Hoàn Kiếm"
+    place_food_map["food_id"] = place_food_map["food_id"].astype(str)
+    if "place_id" in place_food_map.columns:
+        place_food_map["place_id"] = place_food_map["place_id"].astype(str)
+
+    return RecommendationSystem(
+        foods=foods,
+        places=places,
+        place_food_map=place_food_map,
+        users=users,
+        ratings=ratings,
+        train_ratings=ratings,
+        foods_model=foods_model,
+        food_matrix=food_matrix,
+        food_id_to_idx=food_id_to_idx,
+        cf_predictions=cf_predictions,
+        item_mean=item_mean,
+        global_mean=global_mean,
+        popularity_map=popularity_map,
+    )
+
+
+def validate_workbook(file_obj, required_sheets: set[str]) -> tuple[bool, list[str]]:
+    xls = pd.ExcelFile(file_obj)
+    missing = sorted(required_sheets - set(xls.sheet_names))
+    return not missing, missing
+
+
+def find_default_files(data_dir: str | Path = "data") -> tuple[Path | None, Path | None]:
+    data_dir = Path(data_dir)
+    food_file = None
+    rating_file = None
+    for path in list(data_dir.glob("*.xlsx")) + list(Path(".").glob("*.xlsx")):
+        try:
+            sheets = set(pd.ExcelFile(path).sheet_names)
+        except Exception:
+            continue
+        if REQUIRED_FOOD_SHEETS.issubset(sheets):
+            food_file = path
+        if REQUIRED_RATING_SHEETS.issubset(sheets):
+            rating_file = path
+    return food_file, rating_file
